@@ -3,9 +3,11 @@
 
 import json
 import os
+import random
 import re
 import smtplib
 import sys
+import time
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -16,14 +18,16 @@ import requests
 WATCHLIST_FILE = Path(__file__).parent / "watchlist.json"
 STATE_FILE = Path(__file__).parent / "last_state.json"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-}
+# Rotate through different browser profiles to avoid detection
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+]
+
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 5  # seconds
 
 
 def get_config():
@@ -66,48 +70,98 @@ def extract_sku_from_url(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+def get_headers() -> dict:
+    """Get randomized headers to avoid bot detection."""
+    ua = random.choice(USER_AGENTS)
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"' if "Windows" in ua else '"macOS"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+
+def parse_price_from_html(html: str, url: str) -> dict:
+    """Parse product info from HTML response."""
+    if "PerimeterX" in html or "px-captcha" in html:
+        return {"error": "Blocked by bot protection"}
+
+    # Extract JSON-LD Product data
+    pattern = r'<script type="application/ld\+json">\s*(\{[^<]*"@type"\s*:\s*"Product"[^<]*\})\s*</script>'
+    matches = re.findall(pattern, html, re.DOTALL)
+
+    for match in matches:
+        try:
+            data = json.loads(match)
+            if data.get("@type") == "Product":
+                offers = data.get("offers", {})
+                return {
+                    "name": data.get("name"),
+                    "sku": data.get("sku"),
+                    "price": float(offers.get("price", 0)),
+                    "availability": offers.get("availability", ""),
+                }
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    # Fallback: try og:price:amount meta tag
+    og_price = re.search(r'og:price:amount"\s+content="([^"]+)"', html)
+    og_name = re.search(r'og:title"\s+content="([^"]+)"', html)
+    if og_price:
+        return {
+            "name": og_name.group(1) if og_name else "Unknown",
+            "sku": extract_sku_from_url(url),
+            "price": float(og_price.group(1)),
+            "availability": "unknown",
+        }
+
+    return {"error": "Could not parse price from page"}
+
+
 def fetch_price(url: str) -> dict:
-    """Fetch product info from Harbor Freight."""
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        response.raise_for_status()
+    """Fetch product info from Harbor Freight with retries."""
+    last_error = None
 
-        if "PerimeterX" in response.text or "px-captcha" in response.text:
-            return {"error": "Blocked by bot protection"}
+    for attempt in range(MAX_RETRIES):
+        try:
+            if attempt > 0:
+                delay = RETRY_DELAY_BASE * (2 ** (attempt - 1)) + random.uniform(0, 2)
+                print(f"  Retry {attempt}/{MAX_RETRIES - 1} after {delay:.1f}s...")
+                time.sleep(delay)
 
-        # Extract JSON-LD Product data
-        pattern = r'<script type="application/ld\+json">\s*(\{[^<]*"@type"\s*:\s*"Product"[^<]*\})\s*</script>'
-        matches = re.findall(pattern, response.text, re.DOTALL)
+            headers = get_headers()
+            response = requests.get(url, headers=headers, timeout=30)
 
-        for match in matches:
-            try:
-                data = json.loads(match)
-                if data.get("@type") == "Product":
-                    offers = data.get("offers", {})
-                    return {
-                        "name": data.get("name"),
-                        "sku": data.get("sku"),
-                        "price": float(offers.get("price", 0)),
-                        "availability": offers.get("availability", ""),
-                    }
-            except (json.JSONDecodeError, ValueError):
+            # If we get a 403, retry with different headers
+            if response.status_code == 403:
+                last_error = "403 Forbidden"
                 continue
 
-        # Fallback: try og:price:amount meta tag
-        og_price = re.search(r'og:price:amount"\s+content="([^"]+)"', response.text)
-        og_name = re.search(r'og:title"\s+content="([^"]+)"', response.text)
-        if og_price:
-            return {
-                "name": og_name.group(1) if og_name else "Unknown",
-                "sku": extract_sku_from_url(url),
-                "price": float(og_price.group(1)),
-                "availability": "unknown",
-            }
+            response.raise_for_status()
+            result = parse_price_from_html(response.text, url)
 
-        return {"error": "Could not parse price from page"}
+            # If blocked by PerimeterX, retry
+            if "error" in result and "bot protection" in result["error"]:
+                last_error = result["error"]
+                continue
 
-    except requests.RequestException as e:
-        return {"error": str(e)}
+            return result
+
+        except requests.RequestException as e:
+            last_error = str(e)
+            continue
+
+    return {"error": f"Failed after {MAX_RETRIES} attempts: {last_error}"}
 
 
 def check_prices(items: list[dict], previous_state: dict) -> tuple[list[dict], dict]:
@@ -115,7 +169,11 @@ def check_prices(items: list[dict], previous_state: dict) -> tuple[list[dict], d
     alerts = []
     new_state = {"prices": {}}
 
-    for item in items:
+    for i, item in enumerate(items):
+        # Add delay between items to look more natural
+        if i > 0:
+            delay = random.uniform(2, 5)
+            time.sleep(delay)
         url = item["url"]
         threshold = item.get("threshold")
         name = item.get("name", "Unknown Item")
